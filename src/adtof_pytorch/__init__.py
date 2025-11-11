@@ -37,6 +37,7 @@ def transcribe_to_midi(
     threshold: Optional[float] = None,
     thresholds: Optional[Sequence[float]] = None,
     fps: int = 100,
+    return_activations: bool = False,
     weights: Optional[Union[str, Path]] = None,
     device: str = "cuda",
 ) -> Path:
@@ -86,6 +87,9 @@ def transcribe_to_midi(
     x = x.to(device)
     with torch.no_grad():
         pred = model(x).cpu().numpy()  # [1, time, classes]
+
+    if return_activations:
+        return pred
 
     # Threshold resolution
     if thresholds is not None and len(list(thresholds)) > 0:
