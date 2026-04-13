@@ -10,7 +10,8 @@ readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
   "torch",
-  "librosa",
+  "soundfile",
+  "scipy",
   "pretty_midi",
   "numpy",
 ]

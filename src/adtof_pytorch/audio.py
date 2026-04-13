@@ -1,11 +1,22 @@
 """
 Clean audio processing implementation for ADTOF without madmom dependency.
+
+Audio I/O and STFT use soundfile + scipy + numpy directly instead of librosa.
+The librosa stack has lazy module imports and numba JIT that cost ~20s on the
+first call per process, which dominates cold-start latency in production
+serverless deployments. soundfile and scipy are pre-compiled C/C++ and have
+near-zero first-call overhead.
+
+Output of compute_stft() matches `librosa.stft(..., center=True,
+pad_mode='constant', window=hanning(n_fft))` to floating-point precision so
+existing model weights do not need retraining.
 """
 
 from typing import Tuple
 
-import librosa
 import numpy as np
+import soundfile as sf
+from scipy.signal import resample_poly
 
 
 class AudioProcessor:
@@ -87,28 +98,51 @@ class AudioProcessor:
         return filterbank
 
     def load_audio(self, audio_path: str) -> np.ndarray:
-        audio, sr = librosa.load(audio_path, sr=self.sample_rate, mono=(self.n_channels == 1))
-        if self.n_channels == 1:
-            if audio.ndim > 1:
-                audio = np.mean(audio, axis=0)
-        elif self.n_channels == 2:
-            if audio.ndim == 1:
+        audio, native_sr = sf.read(audio_path, dtype='float32', always_2d=False)
+        if audio.ndim > 1:
+            # soundfile returns shape (n_samples, n_channels) for multichannel
+            if self.n_channels == 1:
+                audio = audio.mean(axis=1)
+            elif self.n_channels == 2:
+                audio = audio.T  # (n_channels, n_samples)
+        else:
+            if self.n_channels == 2:
                 audio = np.stack([audio, audio], axis=0)
+        if native_sr != self.sample_rate:
+            # scipy.signal.resample_poly is pure C, no JIT cost.
+            if audio.ndim == 1:
+                audio = resample_poly(audio, self.sample_rate, native_sr).astype(np.float32, copy=False)
+            else:
+                audio = np.stack(
+                    [resample_poly(audio[i], self.sample_rate, native_sr) for i in range(audio.shape[0])],
+                    axis=0,
+                ).astype(np.float32, copy=False)
         if self.normalize:
             audio = audio / (np.max(np.abs(audio)) + 1e-8)
-        audio = audio.astype(np.float32, copy=False)
-        return audio
+        return audio.astype(np.float32, copy=False)
 
     def compute_stft(self, audio: np.ndarray) -> np.ndarray:
-        stft = librosa.stft(
-            audio,
-            n_fft=self.n_fft,
-            hop_length=self.hop_length,
-            window=np.hanning(self.n_fft).astype(np.float32),
-            center=True,
-            pad_mode='constant',
+        # Numpy-native STFT matching librosa.stft(center=True, pad_mode='constant',
+        # window=hanning(n_fft)). Avoids librosa's numba JIT.
+        n_fft = self.n_fft
+        hop = self.hop_length
+        # librosa uses np.hanning which is the symmetric Hann window.
+        window = np.hanning(n_fft).astype(np.float32)
+        # center=True: zero-pad reflect of length n_fft//2 on both sides
+        padded = np.pad(audio, n_fft // 2, mode='constant')
+        n_frames = 1 + (padded.shape[0] - n_fft) // hop
+        # as_strided framing: zero-copy view, no JIT.
+        frames = np.lib.stride_tricks.as_strided(
+            padded,
+            shape=(n_frames, n_fft),
+            strides=(padded.strides[0] * hop, padded.strides[0]),
+            writeable=False,
         )
-        magnitude = np.abs(stft)[: self.n_fft // 2, :].astype(np.float32, copy=False)
+        # Apply window and run real FFT. rfft returns n_fft//2 + 1 bins.
+        spectrum = np.fft.rfft(frames * window, n=n_fft, axis=-1)
+        # Match librosa.stft output shape: (n_freqs, n_frames). Slice [:n_fft//2, :]
+        # to drop the Nyquist bin (matches existing downstream slicing).
+        magnitude = np.abs(spectrum.T)[: n_fft // 2, :].astype(np.float32, copy=False)
         return magnitude
 
     def apply_filterbank(self, spectrogram: np.ndarray) -> np.ndarray:

@@ -1,4 +1,5 @@
 torch
-librosa
+soundfile
+scipy
 pretty_midi
 numpy
